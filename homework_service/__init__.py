@@ -1,0 +1,2 @@
+"""Isolated homework-file service."""
+
