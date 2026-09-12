@@ -11,12 +11,15 @@ def decode_token(token, secret):
         algorithms=['HS256'],
         options={'require': ['exp', 'iat', 'id', 'role']},
     )
-    return {
+    actor = {
         'id': int(payload['id']),
         'role': str(payload['role']),
         'full_name': payload.get('full_name'),
         'group_id': payload.get('group_id'),
     }
+    if actor['role'] == 'staff_admin':
+        actor['session_version'] = payload.get('session_version')
+    return actor
 
 
 def current_actor():
@@ -27,7 +30,11 @@ def current_actor():
     if not token:
         return None
     try:
-        return decode_token(token, current_app.config['JWT_SECRET_KEY'])
+        actor = decode_token(token, current_app.config['JWT_SECRET_KEY'])
+        if actor['role'] == 'staff_admin':
+            from .admin_permissions import load_actor
+            actor = load_actor(actor)
+        return actor
     except (jwt.InvalidTokenError, TypeError, ValueError):
         return None
 
@@ -40,6 +47,10 @@ def authenticated(view):
             return jsonify({'ok': False, 'error': 'unauthorized'}), 401
         if actor['role'] == 'supervisor':
             return jsonify({'ok': False, 'error': 'forbidden'}), 403
+        if actor['role'] == 'staff_admin':
+            from .admin_permissions import allowed
+            if not allowed(actor, request.endpoint):
+                return jsonify({'ok': False, 'error': 'forbidden'}), 403
         kwargs['actor'] = actor
         return view(*args, **kwargs)
     return wrapper
@@ -51,9 +62,8 @@ def roles(*allowed):
         @authenticated
         def wrapper(*args, **kwargs):
             actor = kwargs['actor']
-            if actor['role'] not in allowed:
+            if actor['role'] not in allowed and not (actor['role'] == 'staff_admin' and 'admin' in allowed):
                 return jsonify({'ok': False, 'error': 'forbidden'}), 403
             return view(*args, **kwargs)
         return wrapper
     return decorator
-

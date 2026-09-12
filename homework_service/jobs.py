@@ -77,6 +77,9 @@ def run_one(app):
 
         if _cleanup_one_orphan(cursor, conn):
             return True
+        if _expire_one_upload(cursor, conn, max(int(app.config.get('UPLOAD_STALE_SECONDS', 1800)),
+                                                2 * int(app.config.get('S3_PRESIGN_TTL_SECONDS', 300)))):
+            return True
 
         cursor.execute(
             "UPDATE homework_file_jobs SET status='queued',stage='queued',lease_owner=NULL,lease_expires_at=NULL "
@@ -152,6 +155,34 @@ def _cleanup_one_orphan(cursor, conn):
     return True
 
 
+def _expire_one_upload(cursor, conn, stale_seconds):
+    cursor.execute(
+        "SELECT sub.id FROM homework_submissions sub WHERE EXISTS (SELECT 1 FROM homework_file_jobs j "
+        "WHERE j.submission_id=sub.id AND j.status='uploading' "
+        "AND j.updated_at<DATE_SUB(UTC_TIMESTAMP(6),INTERVAL %s SECOND)) ORDER BY sub.id LIMIT 1 FOR UPDATE",
+        (stale_seconds,),
+    )
+    sub = cursor.fetchone()
+    if not sub:
+        conn.commit()
+        return False
+    cursor.execute("SELECT id,staging_key FROM homework_file_jobs WHERE submission_id=%s AND status='uploading' "
+                   'AND updated_at<DATE_SUB(UTC_TIMESTAMP(6),INTERVAL %s SECOND) FOR UPDATE',
+                   (sub['id'], stale_seconds))
+    jobs = cursor.fetchall()
+    for job in jobs:
+        cursor.execute("UPDATE homework_file_jobs SET status='failed',stage='failed',error_code='upload_expired',"
+                       'updated_at=UTC_TIMESTAMP(6) WHERE id=%s', (job['id'],))
+        if job['staging_key']:
+            cursor.execute("INSERT IGNORE INTO homework_s3_delete_queue (object_key,status,available_at) "
+                           "VALUES (%s,'queued',UTC_TIMESTAMP(6))", (job['staging_key'],))
+    cursor.execute("UPDATE homework_submissions SET state=CASE WHEN current_file_id IS NOT NULL THEN 'revision_requested' "
+                   "WHEN draft_file_id IS NOT NULL THEN 'draft' ELSE 'none' END WHERE id=%s AND state='uploading'",
+                   (sub['id'],))
+    conn.commit()
+    return bool(jobs)
+
+
 def _delete_object(app, row):
     try:
         app.extensions['homework_storage'].delete(row['object_key'])
@@ -171,6 +202,7 @@ def _delete_object(app, row):
 def _process(app, job):
     storage = app.extensions['homework_storage']
     final_key = f'processed/drafts/{uuid.uuid4()}.pdf'
+    committed = False
     try:
         with tempfile.TemporaryDirectory(prefix='cpm-homework-') as folder:
             source = Path(folder) / 'source.pdf'
@@ -186,6 +218,7 @@ def _process(app, job):
             _progress(app, job['id'], 'saving', 75)
             storage.upload_file(output, final_key)
             old_key = _finish_job(job, final_key, info)
+            committed = True
         try:
             storage.delete(job['staging_key'])
         except Exception:
@@ -193,6 +226,10 @@ def _process(app, job):
         if old_key:
             _queue_delete(old_key)
     except JobCancelled:
+        with db.transaction() as (_, cursor):
+            cursor.execute("UPDATE homework_file_jobs SET status='cancelled',stage='cancelled',lease_owner=NULL,"
+                           "lease_expires_at=NULL,updated_at=UTC_TIMESTAMP(6) WHERE id=%s AND status='running'",
+                           (job['id'],))
         try:
             storage.delete(final_key)
         except Exception:
@@ -205,6 +242,11 @@ def _process(app, job):
         _fail(job, exc.code, terminal=True)
         _queue_delete(job['staging_key'], delay_hours=24)
     except Exception as exc:
+        if committed:
+            # Cleanup failure must not remove the PDF already referenced by a
+            # successful submission. Staging also has the bucket lifecycle.
+            logger.warning('homework_cleanup error_code=%s', type(exc).__name__.lower())
+            return
         try:
             storage.delete(final_key)
         except Exception:
@@ -218,12 +260,15 @@ def _process(app, job):
 def _finish_job(job, final_key, info):
     old_key = None
     with db.transaction() as (_, cursor):
-        cursor.execute('SELECT * FROM homework_file_jobs WHERE id=%s FOR UPDATE', (job['id'],))
-        current_job = cursor.fetchone()
-        if not current_job or current_job['status'] == 'cancelled':
-            raise JobCancelled('job_cancelled')
         cursor.execute('SELECT * FROM homework_submissions WHERE id=%s FOR UPDATE', (job['submission_id'],))
         submission = cursor.fetchone()
+        cursor.execute('SELECT * FROM homework_file_jobs WHERE id=%s FOR UPDATE', (job['id'],))
+        current_job = cursor.fetchone()
+        if not current_job or current_job['status'] != 'running' or not submission:
+            raise JobCancelled('job_cancelled')
+        from .workflow import EDITABLE_STATES, HomeworkWorkflow
+        if submission['state'] not in EDITABLE_STATES or HomeworkWorkflow._legacy_graded(cursor, submission):
+            raise JobCancelled('submission_locked')
         if submission['draft_file_id']:
             cursor.execute(
                 'SELECT object_key FROM homework_submission_files WHERE id=%s',
@@ -231,6 +276,9 @@ def _finish_job(job, final_key, info):
             )
             old = cursor.fetchone()
             old_key = old and old['object_key']
+            if old_key:
+                cursor.execute("INSERT IGNORE INTO homework_s3_delete_queue (object_key,status,available_at) "
+                               "VALUES (%s,'queued',UTC_TIMESTAMP(6))", (old_key,))
             cursor.execute('DELETE FROM homework_submission_files WHERE id=%s', (submission['draft_file_id'],))
         cursor.execute(
             "INSERT INTO homework_submission_files "
@@ -265,13 +313,19 @@ def _fail(job, code, terminal):
     status = 'failed' if terminal else 'retry'
     delay = min(30, 2 ** (int(job.get('attempts') or 0) + 1))
     with db.transaction() as (_, cursor):
+        cursor.execute('SELECT * FROM homework_submissions WHERE id=%s FOR UPDATE', (job['submission_id'],))
+        sub = cursor.fetchone()
+        cursor.execute('SELECT status FROM homework_file_jobs WHERE id=%s FOR UPDATE', (job['id'],))
+        current = cursor.fetchone()
+        if not sub or not current or current['status'] != 'running':
+            return  # A cancelled/completed job must never be resurrected by a late failure.
         cursor.execute(
             "UPDATE homework_file_jobs SET status=%s,stage='failed',error_code=%s,lease_owner=NULL,"
             'lease_expires_at=NULL,available_at=DATE_ADD(UTC_TIMESTAMP(6),INTERVAL %s SECOND),'
             'updated_at=UTC_TIMESTAMP(6) WHERE id=%s',
             (status, code, delay, job['id']),
         )
-        if terminal:
+        if terminal and sub['state'] in {'none', 'uploading', 'processing', 'draft', 'revision_requested'}:
             cursor.execute(
                 "UPDATE homework_submissions SET state=CASE "
                 "WHEN current_file_id IS NOT NULL THEN state "

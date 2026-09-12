@@ -3,7 +3,7 @@ from flask import Blueprint, current_app, jsonify, request
 from . import db
 from .auth import authenticated, roles
 from .jobs import runner_status
-from .workflow import WorkflowError
+from .workflow import OMITTED, WorkflowError
 
 
 api = Blueprint('homework_api', __name__, url_prefix='/api')
@@ -73,6 +73,12 @@ def submit(homework_id, actor=None):
     return jsonify(service().submit(actor, homework_id))
 
 
+@api.delete('/workspaces/<int:homework_id>/draft')
+@roles('student')
+def remove_draft(homework_id, actor=None):
+    return jsonify(service().remove_draft(actor, homework_id))
+
+
 @api.get('/review-queue')
 @roles('proctor', 'admin')
 def review_queue(actor=None):
@@ -81,6 +87,7 @@ def review_queue(actor=None):
         request.args.get('state'),
         request.args.get('limit', 50, type=int),
         request.args.get('after', 0, type=int),
+        search=request.args.get('search'),
     ))
 
 
@@ -94,7 +101,7 @@ def register_transition(action):
             submission_id,
             action,
             message=body.get('message'),
-            result=body.get('result'),
+            result=body.get('result', OMITTED),
         ))
 
 
@@ -114,7 +121,7 @@ def file_url(submission_id, actor=None):
 
 
 @api.get('/archive')
-@roles('admin')
+@roles('admin', 'proctor')
 def archive(actor=None):
     return jsonify(service().archive(actor, request.args))
 

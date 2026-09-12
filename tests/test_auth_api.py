@@ -84,9 +84,10 @@ class AuthApiTests(unittest.TestCase):
         for origin in ('https://cpm-lms.ru', 'http://localhost:3000', 'http://127.0.0.1:3000'):
             response = self.client.options(
                 '/api/workspaces/3',
-                headers={'Origin': origin, 'Access-Control-Request-Method': 'GET'},
+                headers={'Origin': origin, 'Access-Control-Request-Method': 'DELETE'},
             )
             self.assertEqual(response.headers.get('Access-Control-Allow-Origin'), origin)
+            self.assertIn('DELETE', response.headers.get('Access-Control-Allow-Methods', ''))
 
 
 if __name__ == '__main__':

@@ -22,7 +22,7 @@ def create_app(overrides=None, initialize_services=True, run_worker=None):
         app,
         origins=cors_origins(app.config),
         allow_headers=['Authorization', 'Content-Type', 'Idempotency-Key'],
-        methods=['GET', 'POST', 'OPTIONS'],
+        methods=['GET', 'POST', 'DELETE', 'OPTIONS'],
         supports_credentials=False,
         max_age=600,
     )
