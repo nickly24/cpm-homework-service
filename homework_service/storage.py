@@ -40,6 +40,23 @@ class HomeworkStorage:
             ExpiresIn=int(self.config.get('S3_PRESIGN_TTL_SECONDS', 300)),
         )
 
+    def check_ready(self):
+        # Read-only capability probe; never create a test object in the live bucket.
+        return self.client.head_bucket(Bucket=self.bucket)
+
+    def verify_absent(self, key):
+        from botocore.exceptions import ClientError
+        try:
+            self.head(key)
+        except ClientError as exc:
+            code = str(exc.response.get('Error', {}).get('Code', ''))
+            status = exc.response.get('ResponseMetadata', {}).get('HTTPStatusCode')
+            if status != 403 and code not in {'403', 'AccessDenied'} and (
+                    code in {'404', 'NoSuchKey', 'NotFound'} or status == 404):
+                return True
+            raise
+        raise RuntimeError('object_still_present')
+
     def head(self, key):
         return self.client.head_object(Bucket=self.bucket, Key=key)
 

@@ -4,6 +4,7 @@ import uuid
 from zoneinfo import ZoneInfo
 
 from . import db
+from .outbox import enqueue_delete
 from .storage import safe_pdf_filename
 
 
@@ -125,6 +126,8 @@ class HomeworkWorkflow:
     @staticmethod
     def _identity(cursor, actor):
         tables = {'student': 'students', 'proctor': 'proctors', 'admin': 'admins', 'staff_admin': 'admin_role_users'}
+        if actor.get('role') == 'student':
+            db.require_student_writable(cursor, actor['id'])
         table = tables.get(actor.get('role'))
         if not table:
             raise WorkflowError('forbidden', 403)
@@ -135,6 +138,7 @@ class HomeworkWorkflow:
     @classmethod
     def _access_student(cls, cursor, actor, student_id):
         cls._identity(cursor, actor)
+        db.require_student_writable(cursor, student_id)
         if actor['role'] == 'student':
             if int(actor['id']) != int(student_id):
                 raise WorkflowError('forbidden', 403)
@@ -295,9 +299,12 @@ class HomeworkWorkflow:
                 job = cursor.fetchone()
             elif job['status'] != 'uploading':
                 return {'job': _job_json(job), 'upload': None, 'poll_after_seconds': 10}
-        upload = self.storage.presigned_upload(
-            job['staging_key'], self.config['PDF_MAX_BYTES'], actor['id']
-        )
+            upload = self.storage.presigned_upload(
+                job['staging_key'], self.config['PDF_MAX_BYTES'], actor['id']
+            )
+            if db.deletion_protection_active():
+                from .purges import record_upload_ownership
+                record_upload_ownership(cursor, job, upload, self.config)
         return {
             'job': _job_json(job),
             'upload': {'method': 'POST', 'url': upload['url'], 'fields': upload['fields']},
@@ -418,7 +425,8 @@ class HomeworkWorkflow:
             except Exception as exc:
                 raise WorkflowError('staging_object_expired', 409) from exc
             cursor.execute(
-                'DELETE FROM homework_s3_delete_queue WHERE object_key=%s',
+                "UPDATE homework_s3_delete_queue SET status='cancelled' WHERE object_key=%s"
+                if db.deletion_protection_active() else 'DELETE FROM homework_s3_delete_queue WHERE object_key=%s',
                 (job['staging_key'],),
             )
             cursor.execute(
@@ -448,16 +456,13 @@ class HomeworkWorkflow:
                 raise WorkflowError('draft_not_ready', 409)
             if sub['state'] not in {'draft', 'revision_requested'}:
                 raise WorkflowError('invalid_state', 409)
+            if sub['current_file_id'] == sub['draft_file_id']:
+                raise WorkflowError('file_reference_conflict', 409)
             if sub['current_file_id']:
                 cursor.execute('SELECT object_key FROM homework_submission_files WHERE id=%s', (sub['current_file_id'],))
                 old = cursor.fetchone()
                 if old:
-                    cursor.execute(
-                        "INSERT IGNORE INTO homework_s3_delete_queue (object_key,status,available_at) "
-                        "VALUES (%s,'queued',UTC_TIMESTAMP(6))",
-                        (old['object_key'],),
-                    )
-                cursor.execute('DELETE FROM homework_submission_files WHERE id=%s', (sub['current_file_id'],))
+                    enqueue_delete(cursor, old['object_key'])
             now = dt.datetime.now(dt.timezone.utc).replace(tzinfo=None)
             cursor.execute("UPDATE homework_submission_files SET status='current' WHERE id=%s", (sub['draft_file_id'],))
             cursor.execute(
@@ -465,6 +470,11 @@ class HomeworkWorkflow:
                 'submitted_at_utc=%s,reviewer_role=NULL,reviewer_id=NULL,revision_comment=NULL WHERE id=%s',
                 (now, sub['id']),
             )
+            if sub['current_file_id']:
+                cursor.execute('UPDATE homework_file_jobs SET result_file_id=NULL '
+                               'WHERE submission_id=%s AND result_file_id=%s',
+                               (sub['id'], sub['current_file_id']))
+                cursor.execute('DELETE FROM homework_submission_files WHERE id=%s', (sub['current_file_id'],))
             return {'state': 'submitted', 'submitted_at_utc': _iso(now)}
 
     def remove_draft(self, actor, homework_id):
@@ -479,15 +489,20 @@ class HomeworkWorkflow:
             self._editable(cursor, sub)
             if self._active_job(cursor, sub['id'], lock=True):
                 raise WorkflowError('upload_in_progress', 409)
+            if sub['draft_file_id'] and sub['draft_file_id'] == sub['current_file_id']:
+                raise WorkflowError('file_reference_conflict', 409)
             if sub['draft_file_id']:
                 cursor.execute('SELECT object_key FROM homework_submission_files WHERE id=%s', (sub['draft_file_id'],))
                 file = cursor.fetchone()
                 if file:
-                    cursor.execute("INSERT IGNORE INTO homework_s3_delete_queue (object_key,status,available_at) VALUES (%s,'queued',UTC_TIMESTAMP(6))",
-                                   (file['object_key'],))
-                cursor.execute('DELETE FROM homework_submission_files WHERE id=%s', (sub['draft_file_id'],))
+                    enqueue_delete(cursor, file['object_key'])
             state = 'revision_requested' if sub['current_file_id'] else 'none'
             cursor.execute('UPDATE homework_submissions SET draft_file_id=NULL,state=%s WHERE id=%s', (state, sub['id']))
+            if sub['draft_file_id']:
+                cursor.execute('UPDATE homework_file_jobs SET result_file_id=NULL '
+                               'WHERE submission_id=%s AND result_file_id=%s',
+                               (sub['id'], sub['draft_file_id']))
+                cursor.execute('DELETE FROM homework_submission_files WHERE id=%s', (sub['draft_file_id'],))
             return {'ok': True, 'state': state}
 
     @staticmethod
@@ -528,6 +543,8 @@ class HomeworkWorkflow:
                     "SET sub.state='submitted',sub.reviewer_role=NULL,sub.reviewer_id=NULL "
                     "WHERE sub.state='in_review' AND sub.reviewer_role='proctor' "
                     "AND (current_p.id IS NULL OR current_p.id<>sub.reviewer_id)"
+                    + (" AND NOT EXISTS (SELECT 1 FROM student_deletion_barriers b WHERE b.student_id=sub.student_id)"
+                       if db.deletion_protection_active() else '')
                 )
             marks = ','.join(['%s'] * len(states))
             where = [f'sub.state IN ({marks})']
@@ -634,17 +651,15 @@ class HomeworkWorkflow:
                     raise WorkflowError('upload_in_progress', 409)
                 cursor.execute('SELECT object_key FROM homework_submission_files WHERE submission_id=%s', (submission_id,))
                 for file_row in cursor.fetchall():
-                    cursor.execute(
-                        "INSERT IGNORE INTO homework_s3_delete_queue (object_key,status,available_at) "
-                        "VALUES (%s,'queued',UTC_TIMESTAMP(6))",
-                        (file_row['object_key'],),
-                    )
-                cursor.execute('DELETE FROM homework_submission_files WHERE submission_id=%s', (submission_id,))
+                    enqueue_delete(cursor, file_row['object_key'])
                 cursor.execute(
                     "UPDATE homework_submissions SET state='none',draft_file_id=NULL,current_file_id=NULL,"
                     'reviewer_role=NULL,reviewer_id=NULL,submitted_at_utc=NULL,revision_comment=NULL WHERE id=%s',
                     (submission_id,),
                 )
+                cursor.execute('UPDATE homework_file_jobs SET result_file_id=NULL '
+                               'WHERE submission_id=%s AND result_file_id IS NOT NULL', (submission_id,))
+                cursor.execute('DELETE FROM homework_submission_files WHERE submission_id=%s', (submission_id,))
                 cursor.execute(
                     'INSERT INTO homework_sessions (homework_id,student_id,status,result,date_pass) '
                     'VALUES (%s,%s,0,0,NULL) ON DUPLICATE KEY UPDATE status=0,result=0,date_pass=NULL',
@@ -740,11 +755,7 @@ class HomeworkWorkflow:
         if not key:
             return
         with db.transaction() as (_, cursor):
-            cursor.execute(
-                "INSERT IGNORE INTO homework_s3_delete_queue (object_key,status,available_at) "
-                "VALUES (%s,'queued',UTC_TIMESTAMP(6))",
-                (key,),
-            )
+            enqueue_delete(cursor, key)
 
     def archive(self, actor, filters):
         if actor['role'] not in {'admin', 'staff_admin', 'proctor'}:

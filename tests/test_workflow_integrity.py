@@ -61,6 +61,20 @@ class WorkflowIntegrityTests(unittest.TestCase):
         return [call.args[0] for call in self.cursor.execute.call_args_list
                 if call.args[0].split()[0] in {'INSERT', 'UPDATE', 'DELETE'}]
 
+    def assert_file_delete_follows_pointer_updates(self, submission_id, old_file_id=None):
+        calls = self.cursor.execute.call_args_list
+        deleted = next(index for index, call in enumerate(calls)
+                       if call.args[0].startswith('DELETE FROM homework_submission_files'))
+        submission_update = next(index for index, call in enumerate(calls)
+                                 if call.args[0].startswith('UPDATE homework_submissions'))
+        job_clear = next(index for index, call in enumerate(calls)
+                         if call.args[0].startswith('UPDATE homework_file_jobs SET result_file_id=NULL'))
+        self.assertLess(submission_update, deleted)
+        self.assertLess(job_clear, deleted)
+        expected = (submission_id, old_file_id) if old_file_id is not None else (submission_id,)
+        self.assertEqual(calls[job_clear].args[1], expected)
+        self.assertIn('WHERE submission_id=%s', calls[job_clear].args[0])
+
     def test_bad_scores_never_enter_grade_transaction(self):
         for value in (None, True, False, float('nan'), float('inf'), 90.5, '90,5', 'abc', '', -1, 101):
             self.assert_code('invalid_result', self.workflow.transition, PROCTOR, 1, 'grade', result=value)
@@ -156,6 +170,41 @@ class WorkflowIntegrityTests(unittest.TestCase):
         self.assertTrue(any('homework_s3_delete_queue' in sql for sql in self.mutations()))
         deletes = [call for call in self.cursor.execute.call_args_list if 'DELETE FROM homework_submission_files' in call.args[0]]
         self.assertEqual(deletes[0].args[1], (3,))
+        self.assert_file_delete_follows_pointer_updates(1, 3)
+
+    def test_submit_repoints_both_kinds_of_reference_before_deleting_old_current(self):
+        self.workflow._submission = MagicMock(return_value=submission('revision_requested', current_file_id=4))
+        self.cursor.fetchone.side_effect = [None, None, {'object_key': 'processed/current.pdf'}]
+        self.assertEqual(self.workflow.submit(STUDENT, 2)['state'], 'submitted')
+        self.assert_file_delete_follows_pointer_updates(1, 4)
+
+    def test_resubmit_clears_submission_and_job_pointers_before_metadata_delete(self):
+        self.cursor.fetchone.side_effect = [submission('graded', current_file_id=4), None]
+        self.cursor.fetchall.return_value = [{'object_key': 'processed/current.pdf'}, {'object_key': 'processed/draft.pdf'}]
+        self.workflow.transition(PROCTOR, 1, 'resubmit')
+        self.assert_file_delete_follows_pointer_updates(1)
+
+    def test_finish_job_repoints_new_draft_then_clears_old_results_before_delete(self):
+        self.cursor.fetchone.side_effect = [submission('processing', current_file_id=4), job(),
+                                           None, {'object_key': 'processed/old-draft.pdf'}]
+        self.cursor.lastrowid = 5
+        old = _finish_job(job(), 'processed/new-draft.pdf',
+                          {'size_bytes': 12, 'page_count': 1, 'sha256': 'abc'})
+        self.assertEqual(old, 'processed/old-draft.pdf')
+        self.assert_file_delete_follows_pointer_updates(1, 3)
+        calls = self.cursor.execute.call_args_list
+        self.assertTrue(any(call.args[0].startswith('UPDATE homework_file_jobs SET status=')
+                            and call.args[1] == (5, 'job-1') for call in calls))
+
+    def test_duplicate_current_draft_reference_is_not_destructively_cleared(self):
+        for method in (self.workflow.submit, self.workflow.remove_draft):
+            self.workflow._submission = MagicMock(return_value=submission('revision_requested', current_file_id=3))
+            self.cursor.fetchone.side_effect = [None, None]
+            self.assert_code('file_reference_conflict', method, STUDENT, 2)
+        self.cursor.fetchone.side_effect = [submission('processing', current_file_id=3), job(), None]
+        with self.assertRaisesRegex(JobCancelled, 'file_reference_conflict'):
+            _finish_job(job(), 'processed/new.pdf', {'size_bytes': 12, 'page_count': 1, 'sha256': 'abc'})
+        self.assertEqual(self.mutations(), [])
 
     def test_remove_draft_is_not_allowed_during_upload_or_after_submission(self):
         self.workflow._submission = MagicMock(return_value=submission('draft'))

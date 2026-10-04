@@ -13,6 +13,7 @@ import mysql.connector
 
 ROOT = Path(__file__).resolve().parents[1]
 MIGRATION = ROOT / 'migrations' / '001_homework_files.sql'
+PURGE_MIGRATION = ROOT / 'migrations' / '002_student_purges.sql'
 
 
 def load_config(main_backend):
@@ -103,6 +104,8 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('mode', choices=('check', 'apply'))
     parser.add_argument('--main-backend-config')
+    parser.add_argument('--student-purges', action='store_true',
+                        help='Apply 002 only after the backend barrier migration; 001 must already be applied')
     args = parser.parse_args()
     connection = mysql.connector.connect(**load_config(args.main_backend_config), autocommit=False)
     try:
@@ -117,7 +120,8 @@ def main():
             return
         cursor.close()
         cursor = connection.cursor()
-        for statement in statements(MIGRATION.read_text()):
+        migration = PURGE_MIGRATION if args.student_purges else MIGRATION
+        for statement in statements(migration.read_text()):
             cursor.execute(statement)
             if cursor.with_rows:
                 cursor.fetchall()
