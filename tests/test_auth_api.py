@@ -1,5 +1,7 @@
 import datetime as dt
 import unittest
+from contextlib import contextmanager
+from unittest.mock import Mock, patch
 
 import jwt
 
@@ -33,6 +35,20 @@ class AuthApiTests(unittest.TestCase):
         )
         self.app.extensions['homework_workflow'] = FakeWorkflow()
         self.client = self.app.test_client()
+        self.live_student = Mock()
+        self.live_student.fetchone.return_value = {'id': 7}
+        @contextmanager
+        def cursor():
+            yield self.live_student
+        value = patch('homework_service.db.read_cursor', cursor)
+        value.start()
+        self.addCleanup(value.stop)
+
+
+    def test_deleted_student_cannot_reuse_old_jwt(self):
+        self.live_student.fetchone.return_value = None
+        response=self.client.get('/api/workspaces/3',headers={'Authorization':f'Bearer {token()}'})
+        self.assertEqual(response.status_code,401)
 
     def test_health_is_public(self):
         self.assertEqual(self.client.get('/health').status_code, 200)

@@ -61,6 +61,9 @@ def run_one(app):
         if not lock_held:
             return False
 
+        cursor.execute("UPDATE homework_s3_delete_queue SET status='retry' "
+                       "WHERE status='running' AND available_at<UTC_TIMESTAMP(6)")
+        conn.commit()
         cursor.execute(
             "SELECT * FROM homework_s3_delete_queue WHERE status IN ('queued','retry') "
             'AND available_at<=UTC_TIMESTAMP(6) ORDER BY id LIMIT 1 FOR UPDATE'
@@ -68,7 +71,7 @@ def run_one(app):
         deletion = cursor.fetchone()
         if deletion:
             cursor.execute(
-                "UPDATE homework_s3_delete_queue SET status='running',attempts=attempts+1 WHERE id=%s",
+                "UPDATE homework_s3_delete_queue SET status='running',attempts=attempts+1,available_at=DATE_ADD(UTC_TIMESTAMP(6),INTERVAL 5 MINUTE) WHERE id=%s",
                 (deletion['id'],),
             )
             conn.commit()
@@ -185,7 +188,16 @@ def _expire_one_upload(cursor, conn, stale_seconds):
 
 def _delete_object(app, row):
     try:
+        with db.read_cursor() as cursor:
+            cursor.execute('SELECT 1 FROM homework_submission_files WHERE object_key=%s LIMIT 1', (row['object_key'],))
+            if cursor.fetchone():
+                raise RuntimeError('object_still_referenced')
+            cursor.execute("SELECT 1 FROM homework_file_jobs WHERE staging_key=%s "
+                           "AND status IN ('uploading','queued','running','retry') LIMIT 1", (row['object_key'],))
+            if cursor.fetchone():
+                raise RuntimeError('object_still_referenced')
         app.extensions['homework_storage'].delete(row['object_key'])
+        app.extensions['homework_storage'].verify_absent(row['object_key'])
         with db.transaction() as (_, cursor):
             cursor.execute('DELETE FROM homework_s3_delete_queue WHERE id=%s', (row['id'],))
     except Exception as exc:

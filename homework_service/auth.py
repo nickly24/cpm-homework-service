@@ -31,6 +31,14 @@ def current_actor():
         return None
     try:
         actor = decode_token(token, current_app.config['JWT_SECRET_KEY'])
+        if actor['role'] == 'student':
+            from . import db
+            with db.read_cursor() as cursor:
+                cursor.execute("SELECT s.id FROM students s WHERE s.id=%s AND EXISTS "
+                               "(SELECT 1 FROM auth_users a WHERE a.role='student' AND a.ref_id=s.id)",
+                               (actor['id'],))
+                if not cursor.fetchone():
+                    return None
         if actor['role'] == 'staff_admin':
             from .admin_permissions import load_actor
             actor = load_actor(actor)

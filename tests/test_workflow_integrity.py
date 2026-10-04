@@ -246,6 +246,14 @@ class WorkflowApiContractTests(unittest.TestCase):
         self.workflow.remove_draft.return_value = {'ok': True}
         self.app.extensions['homework_workflow'] = self.workflow
         self.client = self.app.test_client()
+        @contextmanager
+        def read():
+            cursor=MagicMock()
+            cursor.fetchone.return_value={'id':7}
+            yield cursor
+        value=patch('homework_service.db.read_cursor',read)
+        value.start()
+        self.addCleanup(value.stop)
 
     def request(self, role, url, method='GET', body=None):
         now = dt.datetime.now(dt.timezone.utc)
